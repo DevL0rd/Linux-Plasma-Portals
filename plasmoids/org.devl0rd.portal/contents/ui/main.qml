@@ -383,8 +383,10 @@ PlasmoidItem {
                     FavGrid {
                         id: favStrip
                         Layout.fillWidth: true
-                        // cap the strip to two rows; it scrolls if there are more
-                        Layout.preferredHeight: Math.min(favStrip.gridContentHeight, favStrip.rowHeight * 2)
+                        // cap the strip to two rows; it scrolls if there are more.
+                        // height is count-derived (not the view's contentHeight) to
+                        // avoid a layout binding loop
+                        Layout.preferredHeight: favStrip.twoRowHeight
                         visible: root.allAppsActive && favStrip.items.length > 0
                         favorites: root.favorites
                         searchText: root.searchText

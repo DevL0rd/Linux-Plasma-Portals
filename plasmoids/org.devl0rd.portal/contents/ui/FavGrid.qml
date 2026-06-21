@@ -21,9 +21,18 @@ Item {
 
     readonly property int iconSize: Plasmoid.configuration.iconSize
 
-    // height hints so callers can cap the view (e.g. the All Applications strip)
-    readonly property real gridContentHeight: grid.contentHeight
-    readonly property int rowHeight: grid.cellHeight
+    // grid metrics, derived from config + width only (never from the view's own
+    // height) so a caller can size the strip without creating a layout binding loop
+    readonly property int cellW: iconSize + Kirigami.Units.gridUnit * 2
+    readonly property int rowHeight: iconSize + (Plasmoid.configuration.showAppLabels ? Kirigami.Units.gridUnit * 2.4 : Kirigami.Units.smallSpacing * 3)
+    readonly property int maxCols: Math.max(1, Math.floor(width / cellW))
+    // height needed to show the favourites in at most two rows (0 when empty)
+    readonly property int twoRowHeight: {
+        var n = items.length
+        if (n === 0) return 0
+        var cols = Math.max(1, Math.min(n, maxCols))
+        return Math.min(Math.ceil(n / cols), 2) * rowHeight
+    }
 
     readonly property var items: {
         var q = root.searchText.toLowerCase()
@@ -48,11 +57,9 @@ Item {
         width: cols * cellWidth
         clip: true
         model: root.items
-        readonly property int cell: root.iconSize + Kirigami.Units.gridUnit * 2
-        readonly property int maxCols: Math.max(1, Math.floor(root.width / cell))
-        readonly property int cols: Math.max(1, Math.min(count, maxCols))
-        cellWidth: cell
-        cellHeight: root.iconSize + (Plasmoid.configuration.showAppLabels ? Kirigami.Units.gridUnit * 2.4 : Kirigami.Units.smallSpacing * 3)
+        readonly property int cols: Math.max(1, Math.min(count, root.maxCols))
+        cellWidth: root.cellW
+        cellHeight: root.rowHeight
         boundsBehavior: Flickable.StopAtBounds
         QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
 
