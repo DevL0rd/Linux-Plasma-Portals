@@ -113,6 +113,10 @@ def friend_full(p):
         "appid": appid,
         "game": p.get("gameextrainfo", ""),
         "lastlogoff": p.get("lastlogoff", 0),
+        "country": p.get("loccountrycode", ""),
+        # store-art capsule, addressable from the appid alone (no extra API call)
+        "capsule": (f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}"
+                    "/capsule_184x69.jpg") if appid else "",
         # steam:// actions (and a browser profile fallback)
         "profile": f"steam://url/SteamIDPage/{sid}",
         "profile_web": p.get("profileurl") or f"https://steamcommunity.com/profiles/{sid}",

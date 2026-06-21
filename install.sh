@@ -59,6 +59,14 @@ systemctl --user enable --now portal-friends.service >/dev/null 2>&1 \
     && echo "Enabled portal-friends.service (friends badge in the Games view)" \
     || echo "  (could not enable portal-friends.service -- enable it manually)"
 
+# --- 1c. let the Friends widget read the tmpfs snapshot in-process via QML XHR ---
+# (Qt blocks file:// XHR unless this is set.) environment.d is applied by the
+# systemd user manager, so it survives mid-session plasma restarts too.
+mkdir -p "$HOME/.config/environment.d"
+echo 'QML_XHR_ALLOW_FILE_READ=1' > "$HOME/.config/environment.d/linux-plasma-portals.conf"
+systemctl --user set-environment QML_XHR_ALLOW_FILE_READ=1 2>/dev/null || true
+echo "Set QML_XHR_ALLOW_FILE_READ=1 (environment.d; survives plasma restarts)"
+
 # --- 2. install the plasmoid(s) ---
 echo "Installing widget(s)..."
 for d in "$PLASMOID_SRC"/org.devl0rd.portal*; do

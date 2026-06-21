@@ -3,9 +3,16 @@
  * A friends-list popup that mirrors the App Portal look: a search field plus a
  * sort/filter dropdown in the top bar, then a live list of friends with avatars,
  * presence (in-game / online / away / offline) and a right-click action menu.
- * Presence comes from the shared `portal-friends` collector (Steam Web API),
- * which the App Portal already runs as a resident service. "Favourites" are our
- * own per-instance pins (Steam doesn't expose its favourites), sorted to the top.
+ *
+ * Optimised like the Process Monitor: the snapshot the resident `portal-friends`
+ * collector writes to tmpfs is read IN-PROCESS via XHR (file://) -- no subprocess
+ * per poll -- and the visible rows live in a ListModel that is reconciled in place
+ * (insert/move/set/remove keyed by steamid) so delegates PERSIST and only the
+ * changed values update; the whole list is never destroyed/recreated on refresh.
+ * (Needs QML_XHR_ALLOW_FILE_READ=1, set by install.sh via environment.d.)
+ *
+ * "Favourites" are our own per-instance pins (Steam doesn't expose its own),
+ * sorted into a section at the top.
  */
 import QtQuick
 import QtQuick.Layouts
@@ -25,27 +32,32 @@ PlasmoidItem {
     Connections { target: Plasmoid.configuration; function onIconChanged() { root.refreshIcon() } }
 
     // ---- state ----
-    property var friends: []
+    property var friends: []                 // raw list from the snapshot
+    property var friendsById: ({})           // steamid -> friend, looked up live in delegates
     property string error: ""
     property bool saving: false
     property string searchText: ""
     // toolbar state is per-applet-instance (persisted), like the App Portal
-    property string sortMode: Plasmoid.configuration.sortMode      // status|name|name_desc
+    property string sortMode: Plasmoid.configuration.sortMode      // name|name_desc
     property bool hideOffline: Plasmoid.configuration.hideOffline
+    property string favorites: Plasmoid.configuration.favorites    // comma-separated steamids
+    onSearchTextChanged: rebuild()
+    onSortModeChanged: rebuild()
+    onHideOfflineChanged: rebuild()
+    onFavoritesChanged: rebuild()
 
-    readonly property string bin: "$HOME/.local/bin/portal-friends --snapshot"
     function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
 
     // ---- favourites (our own; comma-separated steamids in config) ----
     function favoritesList() {
-        return (Plasmoid.configuration.favorites || "").split(",").filter(function(s) { return s !== "" })
+        return (root.favorites || "").split(",").filter(function(s) { return s !== "" })
     }
     function isFavorite(sid) { return favoritesList().indexOf(String(sid)) >= 0 }
     function toggleFavorite(sid) {
         sid = String(sid)
         var l = favoritesList(); var i = l.indexOf(sid)
         if (i >= 0) l.splice(i, 1); else l.push(sid)
-        Plasmoid.configuration.favorites = l.join(",")
+        Plasmoid.configuration.favorites = l.join(",")    // -> root.favorites -> rebuild()
     }
 
     // ---- presence helpers (personastate: 0 off,1 on,2 busy,3 away,4 snooze,5/6 on) ----
@@ -71,9 +83,35 @@ PlasmoidItem {
         default: return i18n("Online")
         }
     }
+
     readonly property int onlineCount: (root.friends || []).filter(function(f) {
         return f.ingame || f.state !== 0
     }).length
+
+    // "last online" for offline friends (Steam's value can be stale; shown as-is)
+    function lastOnlineText(f) {
+        if (!f || f.ingame || f.state !== 0) return ""
+        var t = f.lastlogoff || 0
+        if (!t) return ""
+        var diff = Date.now() / 1000 - t
+        if (diff < 60) return i18n("just now")
+        var y = Math.floor(diff / 31536000)
+        if (y >= 1) return i18n("%1y ago", y)
+        var d = Math.floor(diff / 86400)
+        if (d >= 1) return i18n("%1d ago", d)
+        var h = Math.floor(diff / 3600)
+        if (h >= 1) return i18n("%1h ago", h)
+        return i18n("%1m ago", Math.floor(diff / 60))
+    }
+
+    // ISO country code -> regional-indicator flag emoji (rendered with the emoji font)
+    function flagEmoji(cc) {
+        if (!cc || String(cc).length !== 2) return ""
+        var s = String(cc).toUpperCase()
+        var a = s.charCodeAt(0) - 65, b = s.charCodeAt(1) - 65
+        if (a < 0 || a > 25 || b < 0 || b > 25) return ""
+        return String.fromCodePoint(0x1F1E6 + a) + String.fromCodePoint(0x1F1E6 + b)
+    }
 
     // ---- sections: Favourites -> In Game -> Online -> Offline ----
     function sectionOf(f, fav) {
@@ -89,55 +127,94 @@ PlasmoidItem {
         return 2
     }
 
-    // ---- search + filter, grouped into sections, sorted by name within each ----
-    readonly property var view: {
+    // ---- data: read the tmpfs snapshot in-process (no subprocess per poll) ----
+    property string cachePath: ""
+    P5Support.DataSource {
+        id: pathHelper
+        engine: "executable"
+        onNewData: function(source, d) {
+            root.cachePath = (d.stdout || "").trim()
+            disconnectSource(source)
+            root.read()
+        }
+    }
+    function read() {
+        if (!cachePath) return
+        var xhr = new XMLHttpRequest()
+        xhr.open("GET", "file://" + cachePath)
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return
+            if (!xhr.responseText) { root.error = i18n("No snapshot — is the collector running?"); return }
+            root.processSnapshot(xhr.responseText)
+        }
+        xhr.send()
+    }
+    function processSnapshot(text) {
+        var s
+        try { s = JSON.parse(text || "{}") } catch (e) { root.error = i18n("Could not read friends data"); return }
+        root.error = (s.ok === false) ? (s.error || i18n("No data")) : ""
+        root.saving = false
+        var list = s.friends || []
+        var byId = {}
+        for (var i = 0; i < list.length; i++) byId[String(list[i].steamid)] = list[i]
+        root.friends = list
+        root.friendsById = byId        // delegates re-look-up their row from this
+        root.rebuild()
+    }
+
+    // build the desired ordered rows (steamid + section + fav) and reconcile in place
+    function rebuild() {
         var q = root.searchText.toLowerCase()
         var favs = root.favoritesList()
         var dir = root.sortMode === "name_desc" ? -1 : 1
-        var a = (root.friends || []).filter(function(f) {
-            if (root.hideOffline && !f.ingame && f.state === 0) return false
-            if (q !== "" && (f.name || "").toLowerCase().indexOf(q) < 0) return false
-            return true
-        })
-        var mapped = a.map(function(f) {
+        var list = root.friends || []
+        var rows = []
+        for (var i = 0; i < list.length; i++) {
+            var f = list[i]
+            if (root.hideOffline && !f.ingame && f.state === 0) continue
+            if (q !== "" && (f.name || "").toLowerCase().indexOf(q) < 0) continue
             var fav = favs.indexOf(String(f.steamid)) >= 0
-            var o = Object.assign({}, f)
-            o._fav = fav
-            o._section = root.sectionOf(f, fav)
-            o._rank = root.sectionRank(f, fav)
-            return o
+            rows.push({ steamid: String(f.steamid), name: f.name || "", fav: fav,
+                        section: root.sectionOf(f, fav), rank: root.sectionRank(f, fav) })
+        }
+        rows.sort(function(x, y) {
+            if (x.rank !== y.rank) return x.rank - y.rank
+            return dir * x.name.localeCompare(y.name)
         })
-        mapped.sort(function(x, y) {
-            if (x._rank !== y._rank) return x._rank - y._rank
-            return dir * (x.name || "").localeCompare(y.name || "")
+        var desired = rows.map(function(r) {
+            return { steamid: r.steamid, section: r.section, fav: r.fav }
         })
-        return mapped
+        root.syncModel(desired)
     }
 
-    readonly property var sortOptions: [
-        { id: "name", label: i18n("Name (A–Z)"), icon: "view-sort-ascending" },
-        { id: "name_desc", label: i18n("Name (Z–A)"), icon: "view-sort-descending" }
-    ]
-    function iconFor(opts, id, fallback) {
-        for (var i = 0; i < opts.length; i++) if (opts[i].id === id) return opts[i].icon
-        return fallback
-    }
-
-    // ---- data: read the cached snapshot the resident collector writes ----
-    P5Support.DataSource {
-        id: src
-        engine: "executable"
-        onNewData: function(source, d) {
-            disconnectSource(source)
-            try {
-                var s = JSON.parse(d.stdout || "{}")
-                root.friends = s.friends || []
-                root.error = (s.ok === false) ? (s.error || i18n("No data")) : ""
-            } catch (e) { root.error = i18n("Could not read friends data") }
-            root.saving = false
+    // reconcile rowModel against `desired`, keyed by steamid: keep delegates alive,
+    // only insert/move/remove the diff and set() rows whose section/fav changed
+    ListModel { id: rowModel }
+    function syncModel(desired) {
+        var n = desired.length
+        var want = {}
+        for (var i = 0; i < n; i++) want[desired[i].steamid] = true
+        for (var r = rowModel.count - 1; r >= 0; r--)        // drop gone rows
+            if (want[rowModel.get(r).steamid] !== true) rowModel.remove(r)
+        for (var pos = 0; pos < n; pos++) {
+            var d = desired[pos]
+            if (pos < rowModel.count && rowModel.get(pos).steamid === d.steamid) {
+                var a = rowModel.get(pos)                     // already in place
+                if (a.section !== d.section || a.fav !== d.fav) rowModel.set(pos, d)
+                continue
+            }
+            var cur = -1
+            for (var x = pos + 1; x < rowModel.count; x++)
+                if (rowModel.get(x).steamid === d.steamid) { cur = x; break }
+            if (cur < 0) {
+                rowModel.insert(pos, d)                       // new row
+            } else {
+                rowModel.move(cur, pos, 1)                    // moved row
+                var b = rowModel.get(pos)
+                if (b.section !== d.section || b.fav !== d.fav) rowModel.set(pos, d)
+            }
         }
     }
-    function reload() { src.connectSource(root.bin) }
 
     P5Support.DataSource {
         id: runner
@@ -156,12 +233,15 @@ PlasmoidItem {
             + " ; systemctl --user restart portal-friends.service")
         setupReloadTimer.restart()
     }
-    Timer { id: setupReloadTimer; interval: 4000; repeat: false; onTriggered: root.reload() }
+    Timer { id: setupReloadTimer; interval: 4000; repeat: false; onTriggered: root.read() }
 
-    // poll the (cheap, local) snapshot file; the collector refreshes it every 10s
-    Timer { interval: 5000; repeat: true; running: true; onTriggered: root.reload() }
-    Component.onCompleted: { refreshIcon(); reload() }
-    onExpandedChanged: if (expanded) reload()
+    // poll the (cheap, in-process) snapshot read; the collector refreshes it every 10s
+    Timer { interval: 5000; repeat: true; running: true; onTriggered: root.read() }
+    Component.onCompleted: {
+        refreshIcon()
+        pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Plasma-App-Portal/friends.json\"")
+    }
+    onExpandedChanged: if (expanded) read()
 
     // ---- right-click action menu ----
     QQC2.Menu {
@@ -257,42 +337,31 @@ PlasmoidItem {
 
                 // sort + filter dropdown (icon only), like the App Portal
                 QQC2.ToolButton {
-                    icon.name: root.iconFor(root.sortOptions, root.sortMode, "view-sort")
+                    icon.name: root.sortMode === "name_desc" ? "view-sort-descending" : "view-sort-ascending"
                     onClicked: sortMenu.popup()
                     QQC2.ToolTip.text: i18n("Sort & filter"); QQC2.ToolTip.visible: hovered
                     QQC2.Menu {
                         id: sortMenu
-                        Repeater {
-                            model: root.sortOptions
-                            delegate: QQC2.MenuItem {
-                                required property var modelData
-                                text: modelData.label
-                                icon.name: modelData.icon
-                                checkable: true
-                                checked: root.sortMode === modelData.id
-                                onTriggered: {
-                                    root.sortMode = modelData.id
-                                    Plasmoid.configuration.sortMode = modelData.id
-                                }
-                            }
-                        }
-                        // ---- additive filter, separate from sorting ----
-                        QQC2.MenuSeparator {}
                         QQC2.MenuItem {
-                            text: i18n("Hide offline")
-                            icon.name: "im-invisible-user"
-                            checkable: true
-                            checked: root.hideOffline
-                            onTriggered: {
-                                root.hideOffline = checked
-                                Plasmoid.configuration.hideOffline = checked
-                            }
+                            text: i18n("Name (A–Z)"); icon.name: "view-sort-ascending"
+                            checkable: true; checked: root.sortMode === "name"
+                            onTriggered: { root.sortMode = "name"; Plasmoid.configuration.sortMode = "name" }
+                        }
+                        QQC2.MenuItem {
+                            text: i18n("Name (Z–A)"); icon.name: "view-sort-descending"
+                            checkable: true; checked: root.sortMode === "name_desc"
+                            onTriggered: { root.sortMode = "name_desc"; Plasmoid.configuration.sortMode = "name_desc" }
                         }
                         QQC2.MenuSeparator {}
                         QQC2.MenuItem {
-                            text: i18n("Refresh")
-                            icon.name: "view-refresh"
-                            onTriggered: root.reload()
+                            text: i18n("Hide offline"); icon.name: "im-invisible-user"
+                            checkable: true; checked: root.hideOffline
+                            onTriggered: { root.hideOffline = checked; Plasmoid.configuration.hideOffline = checked }
+                        }
+                        QQC2.MenuSeparator {}
+                        QQC2.MenuItem {
+                            text: i18n("Refresh"); icon.name: "view-refresh"
+                            onTriggered: root.read()
                         }
                     }
                 }
@@ -305,38 +374,43 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                model: root.view
+                reuseItems: true
+                cacheBuffer: Kirigami.Units.gridUnit * 20
+                model: rowModel
                 spacing: 1
                 boundsBehavior: Flickable.StopAtBounds
                 QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
 
-                // ---- clear section headers (Favourites / In Game / Online / Offline) ----
-                section.property: "_section"
+                // ---- clear section headers, with a separator (like All Applications) ----
+                section.property: "section"
                 section.criteria: ViewSection.FullString
-                section.delegate: Item {
+                section.delegate: ColumnLayout {
                     width: ListView.view ? ListView.view.width : 0
-                    height: secLabel.implicitHeight + Kirigami.Units.smallSpacing * 1.5
+                    spacing: Kirigami.Units.smallSpacing / 2
                     PlasmaComponents.Label {
-                        id: secLabel
-                        anchors.left: parent.left
-                        anchors.leftMargin: Kirigami.Units.smallSpacing
-                        anchors.bottom: parent.bottom
-                        anchors.bottomMargin: Kirigami.Units.smallSpacing / 2
+                        Layout.fillWidth: true
+                        Layout.leftMargin: Kirigami.Units.smallSpacing
+                        Layout.topMargin: Kirigami.Units.smallSpacing / 2
                         text: section
                         font.pointSize: Kirigami.Theme.smallFont.pointSize
                         font.bold: true
                         opacity: 0.6
                     }
+                    Kirigami.Separator { Layout.fillWidth: true }
                 }
 
                 delegate: Rectangle {
                     id: rowItem
-                    required property var modelData
+                    required property string steamid
+                    required property bool fav
+                    // friend data looked up live -> updates in place when byId refreshes,
+                    // without recreating the delegate
+                    readonly property var f: root.friendsById[steamid] || ({})
+                    readonly property bool dim: !f.ingame && f.state === 0
                     width: ListView.view ? ListView.view.width : 0
                     height: Math.max(Kirigami.Units.gridUnit * 2.2,
                                      Plasmoid.configuration.avatarSize + Kirigami.Units.smallSpacing * 2)
                     radius: Kirigami.Units.smallSpacing
-                    readonly property bool dim: !modelData.ingame && modelData.state === 0
                     color: rowHover.hovered
                         ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g,
                                   Kirigami.Theme.highlightColor.b, 0.18)
@@ -357,13 +431,13 @@ PlasmoidItem {
                                 radius: Kirigami.Units.smallSpacing / 2
                                 color: "transparent"
                                 border.width: 2
-                                border.color: root.stateColor(rowItem.modelData)
+                                border.color: root.stateColor(rowItem.f)
                             }
                             Image {
                                 id: avatarImg
                                 anchors.fill: parent
                                 anchors.margins: 2
-                                source: rowItem.modelData.avatar || ""
+                                source: rowItem.f.avatar || ""
                                 fillMode: Image.PreserveAspectCrop
                                 asynchronous: true; cache: true
                                 opacity: rowItem.dim ? 0.5 : 1.0
@@ -384,7 +458,7 @@ PlasmoidItem {
                                 Layout.fillWidth: true
                                 spacing: Kirigami.Units.smallSpacing / 2
                                 Kirigami.Icon {
-                                    visible: rowItem.modelData._fav === true
+                                    visible: rowItem.fav
                                     source: "starred-symbolic"
                                     color: "#f0b400"
                                     Layout.preferredWidth: Kirigami.Units.iconSizes.small
@@ -392,20 +466,50 @@ PlasmoidItem {
                                 }
                                 PlasmaComponents.Label {
                                     Layout.fillWidth: true
-                                    text: rowItem.modelData.name || ""
+                                    text: rowItem.f.name || ""
                                     elide: Text.ElideRight
                                     font.weight: Font.DemiBold
                                     opacity: rowItem.dim ? 0.6 : 1.0
-                                    color: rowItem.modelData.ingame ? root.cInGame : Kirigami.Theme.textColor
+                                    color: rowItem.f.ingame ? root.cInGame : Kirigami.Theme.textColor
                                 }
                             }
                             PlasmaComponents.Label {
                                 Layout.fillWidth: true
-                                text: root.stateText(rowItem.modelData)
+                                text: root.stateText(rowItem.f)
                                 elide: Text.ElideRight
                                 font: Kirigami.Theme.smallFont
                                 opacity: 0.7
-                                color: rowItem.modelData.ingame ? root.cInGame : Kirigami.Theme.textColor
+                                color: rowItem.f.ingame ? root.cInGame : Kirigami.Theme.textColor
+                            }
+                        }
+
+                        // right side: game art (in-game), else flag + last-online
+                        Image {
+                            visible: rowItem.f.ingame && rowItem.f.capsule
+                            source: visible ? rowItem.f.capsule : ""
+                            Layout.preferredHeight: Plasmoid.configuration.avatarSize * 0.62
+                            Layout.preferredWidth: Layout.preferredHeight * (184 / 69)
+                            fillMode: Image.PreserveAspectFit
+                            asynchronous: true; cache: true
+                        }
+                        ColumnLayout {
+                            readonly property string flag: root.flagEmoji(rowItem.f.country)
+                            readonly property string ago: root.lastOnlineText(rowItem.f)
+                            visible: !rowItem.f.ingame && (flag !== "" || ago !== "")
+                            spacing: 0
+                            PlasmaComponents.Label {
+                                Layout.alignment: Qt.AlignRight
+                                visible: parent.flag !== ""
+                                text: parent.flag
+                                font.family: "Noto Color Emoji"
+                                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                            }
+                            PlasmaComponents.Label {
+                                Layout.alignment: Qt.AlignRight
+                                visible: parent.ago !== ""
+                                text: parent.ago
+                                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                opacity: 0.55
                             }
                         }
                     }
@@ -413,30 +517,20 @@ PlasmoidItem {
                     HoverHandler { id: rowHover }
                     TapHandler {
                         acceptedButtons: Qt.LeftButton
-                        onTapped: root.steamRun(rowItem.modelData.chat)
+                        onTapped: root.steamRun(rowItem.f.chat)
                     }
                     TapHandler {
                         acceptedButtons: Qt.RightButton
-                        onTapped: root.popMenu(rowItem.modelData)
+                        onTapped: root.popMenu(rowItem.f)
                     }
                 }
-            }
-
-            // ---- states ----
-            PlasmaComponents.Label {
-                Layout.fillWidth: true
-                horizontalAlignment: Text.AlignHCenter
-                visible: root.error !== ""
-                text: root.error
-                opacity: 0.6
-                wrapMode: Text.Wrap
             }
         }
 
         // empty hint sits over the list area
         PlasmaComponents.Label {
             anchors.centerIn: parent
-            visible: root.error === "" && root.view.length === 0
+            visible: root.error === "" && rowModel.count === 0
             text: root.searchText !== "" ? i18n("No matches")
                 : root.hideOffline ? i18n("No friends online")
                 : i18n("No friends to show")
