@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+    <kcfgfile name=""/>
+    <group name="General">
+        <entry name="icon" type="String"><default>applications-all</default></entry>
+        <entry name="iconSize" type="Int"><default>64</default></entry>
+        <entry name="gameCardWidth" type="Int"><default>150</default></entry>
+        <entry name="defaultCategory" type="String"><default>Favorites</default></entry>
+        <entry name="gamesViewMode" type="String"><default>grid</default></entry>
+        <entry name="appViewMode" type="String"><default>grid</default></entry>
+        <entry name="defaultSort" type="String"><default>recent</default></entry>
+        <entry name="showAppLabels" type="Bool"><default>true</default></entry>
+        <entry name="showGameTitles" type="Bool"><default>true</default></entry>
+    </group>
+</kcfg>
