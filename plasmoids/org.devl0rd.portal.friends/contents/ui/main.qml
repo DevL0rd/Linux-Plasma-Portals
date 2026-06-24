@@ -485,7 +485,7 @@ PlasmoidItem {
 
                         // right side: game art (in-game), else flag + last-online
                         Image {
-                            visible: rowItem.f.ingame && rowItem.f.capsule
+                            visible: !!(rowItem.f.ingame && rowItem.f.capsule)
                             source: visible ? rowItem.f.capsule : ""
                             Layout.preferredHeight: Plasmoid.configuration.avatarSize * 0.62
                             Layout.preferredWidth: Layout.preferredHeight * (184 / 69)
