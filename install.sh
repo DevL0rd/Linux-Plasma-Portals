@@ -68,6 +68,13 @@ systemctl --user set-environment QML_XHR_ALLOW_FILE_READ=1 2>/dev/null || true
 echo "Set QML_XHR_ALLOW_FILE_READ=1 (environment.d; survives plasma restarts)"
 
 # --- 2. install the plasmoid(s) ---
+if [ ! -e "$REPO_DIR/shared/common/FileWatcher.qml" ]; then
+    echo "  ! shared/common (Linux-Plasma-Shared submodule) is empty." >&2
+    echo "    Run: git submodule update --init --recursive" >&2
+    exit 1
+fi
+# shared (submodule) component — only the friends widget uses it
+cp "$REPO_DIR/shared/common/FileWatcher.qml" "$PLASMOID_SRC/org.devl0rd.portal.friends/contents/ui/"
 echo "Installing widget(s)..."
 for d in "$PLASMOID_SRC"/org.devl0rd.portal*; do
     if kpackagetool6 -t Plasma/Applet -u "$d" >/dev/null 2>&1; then
